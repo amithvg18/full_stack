@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Backend Test</title>
+</head>
+<body>
+    <h1>Backend Connection Test</h1>
+    
+    <h2>Video Feed Test</h2>
+    <img src="http://localhost:8000/video/1" alt="Lane 1" style="width: 640px; border: 2px solid red;">
+    
+    <h2>WebSocket Test</h2>
+    <div id="ws-status">Connecting...</div>
+    <pre id="ws-data"></pre>
+    
+    <script>
+        const ws = new WebSocket('ws://localhost:8000/ws/emergency');
+        
+        ws.onopen = () => {
+            document.getElementById('ws-status').textContent = 'Connected!';
+            document.getElementById('ws-status').style.color = 'green';
+        };
+        
+        ws.onmessage = (event) => {
+            document.getElementById('ws-data').textContent = event.data;
+        };
+        
+        ws.onerror = (error) => {
+            document.getElementById('ws-status').textContent = 'Error: ' + error;
+            document.getElementById('ws-status').style.color = 'red';
+            console.error('WebSocket error:', error);
+        };
+        
+        ws.onclose = () => {
+            document.getElementById('ws-status').textContent = 'Disconnected';
+            document.getElementById('ws-status').style.color = 'orange';
+        };
+    </script>
+</body>
+</html>
