@@ -1,6 +1,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import cv2
 import asyncio
 import json
@@ -14,33 +15,23 @@ from traffic_control import TrafficController
 from detection import EmergencyDetector
 from stream import VideoManager
 
-app = FastAPI()
-
 # Ensure uploads directory exists
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Load Sources from JSON
 try:
     with open("sources.json", "r") as f:
         config = json.load(f)
-        video_sources = {
-            1: config.get("lane1", 0),
-            2: config.get("lane2", "video2.mp4"),
-            3: config.get("lane3", "video3.mp4"),
-            4: config.get("lane4", "video4.mp4")
-        }
+        video_sources = {}
+        # Only add lanes that are explicitly configured
+        for lane_num in [1, 2, 3, 4]:
+            lane_key = f"lane{lane_num}"
+            if lane_key in config:
+                video_sources[lane_num] = config[lane_key]
 except Exception as e:
-    print(f"Error loading sources.json: {e}. Using defaults.")
-    video_sources = {1: 0, 2: "video2.mp4", 3: "video3.mp4", 4: "video4.mp4"}
+    print(f"Error loading sources.json: {e}. Starting with no videos.")
+    video_sources = {}
 
 video_manager = VideoManager(video_sources)
 traffic_controller = TrafficController()
@@ -49,16 +40,71 @@ detector = EmergencyDetector() # Loads best.pt
 latest_processed_frames = {}
 latest_detections = {}  # Store detection info per lane
 
-@app.on_event("startup")
-async def startup_event():
-    video_manager.start_all()
-    await traffic_controller.start()
-    asyncio.create_task(processing_loop())
+# Video initialization tracking
+processing_started = False
+system_started = False  # Track if entire system (video_manager + traffic_controller + processing) has started
+lanes_with_videos = set()  # Track which lanes have videos loaded
+processing_task = None  # Store the processing task reference
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    video_manager.stop_all()
-    await traffic_controller.stop()
+async def start_processing():
+    """Start the processing loop if not already started"""
+    global processing_started, processing_task
+    if not processing_started:
+        processing_started = True
+        processing_task = asyncio.create_task(processing_loop())
+        print("✅ Processing loop started!")
+
+async def start_system():
+    """Start the entire system: video manager, traffic controller, and processing loop"""
+    global system_started
+    if system_started:
+        print("ℹ️ System already started.")
+        return
+    
+    print("🚀 Starting entire system with all 4 videos...")
+    system_started = True
+    
+    # Start video streams for all lanes
+    video_manager.start_all()
+    print("✅ Video manager started for all lanes")
+    
+    # Start traffic controller
+    await traffic_controller.start()
+    print("✅ Traffic controller started")
+    
+    # Start processing loop
+    await start_processing()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    # Check if all lanes already have videos from sources.json
+    for lane_id in [1, 2, 3, 4]:
+        if lane_id in video_sources:
+            lanes_with_videos.add(lane_id)
+    
+    # If all 4 lanes have videos, start the entire system
+    if len(lanes_with_videos) == 4:
+        await start_system()
+    else:
+        print(f"⏳ Waiting for all videos to be uploaded. Currently have {len(lanes_with_videos)}/4 lanes ready.")
+    
+    yield
+    
+    # Shutdown - only stop if system was started
+    if system_started:
+        video_manager.stop_all()
+        await traffic_controller.stop()
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 async def processing_loop():
     frame_count = 0
@@ -180,12 +226,18 @@ async def simulate_emergency(lane_id: int, active: bool):
 
 @app.post("/upload/{lane_id}")
 async def upload_video(lane_id: int, file: UploadFile = File(...)):
+    global lanes_with_videos
+    
     file_path = os.path.join(UPLOAD_DIR, f"lane{lane_id}_{file.filename}")
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
     # Update video manager with new file source
     video_manager.update_source(lane_id, file_path)
+    
+    # Track this lane as having a video
+    lanes_with_videos.add(lane_id)
+    print(f"✅ Video uploaded for Lane {lane_id}. Total lanes ready: {len(lanes_with_videos)}/4")
     
     # Update sources.json so it persists (optional but good)
     try:
@@ -196,11 +248,87 @@ async def upload_video(lane_id: int, file: UploadFile = File(...)):
             json.dump(config, f)
     except:
         pass
+    
+    # Auto-start entire system when all 4 lanes have videos
+    if len(lanes_with_videos) == 4 and not system_started:
+        await start_system()
 
-    return {"status": "success", "file_path": file_path}
+    return {
+        "status": "success", 
+        "file_path": file_path,
+        "lanes_ready": len(lanes_with_videos),
+        "processing_started": processing_started,
+        "system_started": system_started
+    }
+
+@app.post("/start_processing")
+async def manual_start_processing():
+    """Manually start the entire system (useful for testing or if auto-start fails)"""
+    if system_started:
+        return {"status": "already_running", "message": "System is already running"}
+    
+    if len(lanes_with_videos) < 4:
+        return {
+            "status": "error", 
+            "message": f"Cannot start system. Need all 4 videos. Currently have {len(lanes_with_videos)}/4 lanes ready."
+        }
+    
+    await start_system()
+    return {"status": "success", "message": "System started successfully"}
+
+@app.get("/status")
+async def get_status():
+    """Get current backend status"""
+    return {
+        "system_started": system_started,
+        "processing_started": processing_started,
+        "lanes_ready": len(lanes_with_videos),
+        "lanes_with_videos": list(lanes_with_videos)
+    }
+
+@app.delete("/videos")
+async def clear_all_videos():
+    """Clear all videos and reset system state"""
+    global system_started, processing_started, lanes_with_videos, latest_processed_frames, latest_detections
+    
+    # Stop everything
+    video_manager.stop_all()
+    await traffic_controller.stop()
+    
+    # Reset traffic controller emergency state
+    traffic_controller.emergency_mode = False
+    traffic_controller.emergency_lane_id = None
+    
+    # Reset globals
+    system_started = False
+    processing_started = False
+    lanes_with_videos.clear()
+    latest_processed_frames.clear()
+    latest_detections.clear()
+    
+    # Clear sources.json
+    try:
+        with open("sources.json", "w") as f:
+            json.dump({}, f)
+    except:
+        pass
+
+    # Clear VideoManager streams
+    # We need to access the internal streams dict to clear it or define a clear method
+    # For now, we'll manually clear it by iterating
+    # Note: stop_all() just stops threads, doesn't remove objects.
+    # We should add a clear_all to VideoManager ideally, but we can't edit that file concurrently.
+    # Wait, strict checking says we can't edit multiple files in parallel safely in one turn cleanly 
+    # without tool ordering issues sometimes? No, I will rely on Python object reference.
+    video_manager.streams.clear()
+
+    print("♻️ System fully reset and all videos cleared.")
+    return {"status": "success", "message": "All videos cleared and system reset"}
 
 @app.delete("/video/{lane_id}")
 async def clear_video(lane_id: int):
+    global lanes_with_videos
+    
     # Stop the stream for this lane
     video_manager.stop(lane_id)
     
@@ -211,6 +339,10 @@ async def clear_video(lane_id: int):
     # Remove from detections
     if lane_id in latest_detections:
         del latest_detections[lane_id]
+    
+    # Remove from lanes_with_videos
+    if lane_id in lanes_with_videos:
+        lanes_with_videos.remove(lane_id)
 
     print(f"Lane {lane_id}: Video cleared.")
     return {"status": "success", "message": f"Video cleared for Lane {lane_id}"}

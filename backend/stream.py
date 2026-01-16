@@ -12,7 +12,7 @@ class VideoStream:
         self.current_frame: Optional[np.ndarray] = None
         self.running = False
         self.lock = threading.Lock()
-        self._initialize_capture()
+        # Don't initialize capture here - wait until start() is called
         
     def _initialize_capture(self):
         """Initialize video capture with error handling"""
@@ -30,6 +30,9 @@ class VideoStream:
     def start(self):
         if self.running:
             return
+        # Initialize capture before starting the thread
+        if self.cap is None:
+            self._initialize_capture()
         self.running = True
         threading.Thread(target=self._update, daemon=True).start()
     
@@ -105,10 +108,19 @@ class VideoManager:
     def update_source(self, lane_id: int, new_source: str):
         if lane_id in self.streams:
             self.streams[lane_id].stop()
-            new_stream = VideoStream(new_source, lane_id)
-            self.streams[lane_id] = new_stream
-            new_stream.start()
-            print(f"Updated Lane {lane_id} source to: {new_source}")
+        
+        # Create and start new stream for this lane (whether it existed or not)
+        new_stream = VideoStream(new_source, lane_id)
+        self.streams[lane_id] = new_stream
+        
+        # Only start if supposed to be running? 
+        # For now, we always start it because individual streams handle their own state
+        # But wait, if system hasn't started, maybe we shouldn't start the stream thread?
+        # Actually, VideoStream.start() handles the capture init.
+        # Let's just create it. The main system start will call start_all(), 
+        # OR if we are doing a live swap, we should start it.
+        new_stream.start()
+        print(f"Updated Lane {lane_id} source to: {new_source}")
             
     def get_frame(self, lane_id: int) -> Optional[np.ndarray]:
         if lane_id in self.streams:

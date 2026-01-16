@@ -32,11 +32,24 @@ export default function Home() {
         </div>
 
         <div className="flex items-center gap-6 mt-4 md:mt-0">
-          <div className="flex flex-col items-end">
-            <div className="text-xs uppercase tracking-widest text-slate-500 font-semibold mb-1">System Status</div>
-            <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-sm font-bold border ${isConnected ? 'bg-green-500/10 border-green-500/50 text-green-400' : 'bg-red-500/10 border-red-500/50 text-red-400'}`}>
-              <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
-              {isConnected ? 'ONLINE' : 'OFFLINE'}
+          <div className="flex flex-col items-end gap-2">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={async () => {
+                  if (confirm('Are you sure you want to clear all videos? This will stop the system.')) {
+                    await fetch(`${apiBaseUrl}/videos`, { method: 'DELETE' });
+                    window.location.reload();
+                  }
+                }}
+                className="text-[10px] bg-red-900/40 hover:bg-red-900/80 text-red-200 px-3 py-1.5 rounded-lg border border-red-800 transition-all font-bold tracking-wider hover:shadow-[0_0_15px_rgba(220,38,38,0.4)]"
+              >
+                RESET SYSTEM
+              </button>
+
+              <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-sm font-bold border ${isConnected ? 'bg-green-500/10 border-green-500/50 text-green-400' : 'bg-red-500/10 border-red-500/50 text-red-400'}`}>
+                <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
+                {isConnected ? 'ONLINE' : 'OFFLINE'}
+              </div>
             </div>
           </div>
         </div>
