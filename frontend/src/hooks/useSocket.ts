@@ -8,19 +8,21 @@ interface LaneState {
   has_emergency: boolean;
 }
 
-interface TrafficState {
-  signals: { [key: string]: SignalState };
+interface SocketData {
+  signals: Record<string, 'RED' | 'YELLOW' | 'GREEN'>;
   emergency: {
     is_active: boolean;
     lane_id: number | null;
   };
-  detections?: {
-    [key: string]: Array<{ class: string; confidence: number }>
+  accident?: {
+    is_active: boolean;
+    lane_id: number | null;
   };
+  detections: Record<string, Array<{ class: string; confidence: number }>>;
 }
 
 export const useSocket = (url: string) => {
-  const [data, setData] = useState<TrafficState | null>(null);
+  const [data, setData] = useState<SocketData | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
 

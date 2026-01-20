@@ -10,9 +10,50 @@ export default function Home() {
 
   const { data, isConnected } = useSocket(wsUrl);
 
+  // Track which lanes have videos uploaded
+  const [uploadedLanes, setUploadedLanes] = React.useState<boolean[]>([false, false, false, false]);
+  const [isStarting, setIsStarting] = React.useState(false);
+
   // Default lane configuration
   const lanes = [1, 2, 3, 4];
   const videoBaseUrl = `${apiBaseUrl}/video`;
+
+  const allUploaded = uploadedLanes.every(uploaded => uploaded);
+
+  const handleUploadSuccess = (laneId: number) => {
+    setUploadedLanes(prev => {
+      const newState = [...prev];
+      newState[laneId - 1] = true;
+      return newState;
+    });
+  };
+
+  const handleStartSimulation = async () => {
+    setIsStarting(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/simulation/start`, { method: 'POST' });
+      if (response.ok) {
+        console.log('Simulation started successfully');
+        // Reload after a short delay to reset frontend state
+        setTimeout(() => window.location.reload(), 1000);
+      } else {
+        const error = await response.json();
+        alert(`Failed to start simulation: ${error.message}`);
+      }
+    } catch (error) {
+      console.error('Failed to start simulation:', error);
+      alert('Failed to start simulation');
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  const handleResetSystem = async () => {
+    if (confirm('Are you sure you want to reset the system? This will clear all videos.')) {
+      await fetch(`${apiBaseUrl}/simulation/reset`, { method: 'POST' });
+      window.location.reload();
+    }
+  };
 
   return (
     <main className="min-h-screen bg-slate-950 text-white p-8 font-sans selection:bg-red-500/30">
@@ -35,12 +76,18 @@ export default function Home() {
           <div className="flex flex-col items-end gap-2">
             <div className="flex items-center gap-2">
               <button
-                onClick={async () => {
-                  if (confirm('Are you sure you want to clear all videos? This will stop the system.')) {
-                    await fetch(`${apiBaseUrl}/videos`, { method: 'DELETE' });
-                    window.location.reload();
-                  }
-                }}
+                onClick={handleStartSimulation}
+                disabled={!allUploaded || isStarting}
+                className={`text-[10px] px-4 py-2 rounded-lg border transition-all font-bold tracking-wider ${allUploaded
+                    ? 'bg-green-600/90 hover:bg-green-500 text-white border-green-500 hover:shadow-[0_0_20px_rgba(34,197,94,0.5)] cursor-pointer'
+                    : 'bg-slate-700/50 text-slate-500 border-slate-600 cursor-not-allowed'
+                  }`}
+              >
+                {isStarting ? '⏳ STARTING...' : '▶ START SIMULATION'}
+              </button>
+
+              <button
+                onClick={handleResetSystem}
                 className="text-[10px] bg-red-900/40 hover:bg-red-900/80 text-red-200 px-3 py-1.5 rounded-lg border border-red-800 transition-all font-bold tracking-wider hover:shadow-[0_0_15px_rgba(220,38,38,0.4)]"
               >
                 RESET SYSTEM
@@ -71,12 +118,13 @@ export default function Home() {
               signalState={signalState}
               isEmergency={!!isEmergency}
               detections={detections}
+              onUploadSuccess={handleUploadSuccess}
             />
           );
         })}
       </div>
 
-      {/* Global Alert Overlay */}
+      {/* Global Alert Overlay: Emergency */}
       {data?.emergency.is_active && (
         <div className="fixed bottom-8 left-1/2 transform -translate-x-1/2 z-50 w-full max-w-2xl px-4">
           <div className="bg-red-600/90 backdrop-blur-md text-white px-8 py-4 rounded-2xl shadow-[0_0_50px_rgba(220,38,38,0.5)] border-2 border-red-400 flex items-center justify-between animate-slide-up">

@@ -7,9 +7,11 @@ interface VideoCardProps {
     signalState: 'RED' | 'YELLOW' | 'GREEN';
     isEmergency: boolean;
     detections?: Array<{ class: string; confidence: number }>;
+    onUploadSuccess?: (laneId: number) => void;
 }
 
-const VideoCard: React.FC<VideoCardProps> = ({ laneId, videoUrl, signalState, isEmergency, detections = [] }) => {
+const VideoCard: React.FC<VideoCardProps> = ({ laneId, videoUrl, signalState, isEmergency, detections = [], onUploadSuccess }) => {
+    // ... (refs and hooks)
     const fileInputRef = React.useRef<HTMLInputElement>(null);
     const [uploading, setUploading] = React.useState(false);
     const [streamKey, setStreamKey] = React.useState<number | null>(null);
@@ -20,7 +22,9 @@ const VideoCard: React.FC<VideoCardProps> = ({ laneId, videoUrl, signalState, is
 
     const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
+    // ... (handlers)
     const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+        // ... (existing implementation)
         const file = event.target.files?.[0];
         if (!file) return;
 
@@ -35,7 +39,7 @@ const VideoCard: React.FC<VideoCardProps> = ({ laneId, videoUrl, signalState, is
             });
             if (response.ok) {
                 console.log(`Video uploaded for Lane ${laneId}`);
-                // Force refresh of the video stream
+                onUploadSuccess?.(laneId);
                 setTimeout(() => setStreamKey(Date.now()), 1000);
             }
         } catch (error) {
@@ -45,10 +49,11 @@ const VideoCard: React.FC<VideoCardProps> = ({ laneId, videoUrl, signalState, is
         }
     };
 
+    // ... (other handlers)
     const handleSimulateEmergency = async () => {
+        // ...
         try {
             await fetch(`${apiBaseUrl}/signal/${laneId}/simulate_emergency?active=true`, { method: 'POST' });
-            // Auto-clear after 5 seconds
             setTimeout(() => {
                 fetch(`${apiBaseUrl}/signal/${laneId}/simulate_emergency?active=false`, { method: 'POST' });
             }, 5000);

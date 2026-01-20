@@ -1,7 +1,7 @@
 import asyncio
 import time
 from enum import Enum
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 class SignalState(Enum):
     RED = "RED"
@@ -38,10 +38,15 @@ class TrafficController:
         self.lanes = [LaneState(i) for i in range(1, num_lanes + 1)]
         self.hardware = HardwareInterface() # Initialize hardware
         self.current_green_lane_index = 0
+        
+        # Emergency Logic
         self.emergency_mode = False
-        self.emergency_lane_id: Optional[int] = None
-        self.yellow_duration = 1  # Reduced to 1s for faster response
-        self.green_duration = 10 # seconds for normal cycle
+        self.active_emergency_lanes: List[int] = [] # List of lanes demanding priority
+        self.emergency_lane_id: Optional[int] = None # The specific lane currently given Green (for compatibility & focus)
+        
+        self.yellow_duration = 2 # Safety transition time
+        self.green_duration = 10 # seconds for normal cycle & priority round robin
+        
         self.running = False
         self.last_switch_time = 0.0
         self.loop_task = None
@@ -66,125 +71,157 @@ class TrafficController:
     def get_states(self) -> Dict[str, str]:
         return {f"lane{lane.lane_id}": lane.state.value for lane in self.lanes}
 
-    def set_emergency(self, lane_id: int, detected: bool):
-        if detected:
-            if not self.emergency_mode or self.emergency_lane_id != lane_id:
-                # New emergency or different lane
-                print(f"Emergency detected in Lane {lane_id}. Initiating pre-emption.")
-                asyncio.create_task(self._handle_emergency_preemption(lane_id))
+    def update_emergency_state(self, lane_ids: List[int]):
+        """
+        Update the list of lanes checking for emergencies.
+        Handle state transitions (Normal -> Emergency) here if needed,
+        but main logic is in the control loop.
+        """
+        self.active_emergency_lanes = lane_ids
+        
+        if len(self.active_emergency_lanes) > 0:
+            if not self.emergency_mode:
+                print(f"🚨 Emergency detected in Lanes {self.active_emergency_lanes}. Entering Emergency Mode.")
+                self.emergency_mode = True
+                # Reset switch time to valid immediate action
+                self.last_switch_time = 0 
         else:
-            if self.emergency_mode and self.emergency_lane_id == lane_id:
-                # Emergency cleared
-                print(f"Emergency cleared in Lane {lane_id}. Resuming normal operation.")
+            if self.emergency_mode:
+                print("✅ Emergency cleared. Resuming normal operation.")
                 self.emergency_mode = False
                 self.emergency_lane_id = None
-                self.last_switch_time = time.time() # Reset timer for normal cycle
+                self.last_switch_time = time.time() # Reset for normal cycle
 
-    async def _handle_emergency_preemption(self, lane_id: int):
-        async with self._lock:
-            self.emergency_mode = True
-            self.emergency_lane_id = lane_id
+    async def _control_loop(self):
+        while self.running:
+            try:
+                async with self._lock:
+                    now = time.time()
+                    
+                    # --- STATE 0: No Emergency ---
+                    if not self.emergency_mode:
+                        # Normal Cycle
+                        if now - self.last_switch_time >= self.green_duration:
+                            await self._cycle_next_lane()
 
-            # 1. Identify currently GREEN lanes that are NOT the emergency lane
-            active_lane_idx = -1
-            for i, lane in enumerate(self.lanes):
-                if lane.state == SignalState.GREEN and lane.lane_id != lane_id:
-                    active_lane_idx = i
-                    break
-            
-            # 2. If there is a conflicting GREEN lane, switch to YELLOW first
-            if active_lane_idx != -1:
-                lane = self.lanes[active_lane_idx]
-                print(f"Switching Lane {lane.lane_id} to YELLOW (Clearance).")
+                    # --- Emergency Handling ---
+                    else:
+                        count = len(self.active_emergency_lanes)
+                        
+                        # --- STATE 1: Single Emergency ---
+                        if count == 1:
+                            target = self.active_emergency_lanes[0]
+                            # Create sticky behavior
+                            if self.emergency_lane_id != target:
+                                self.emergency_lane_id = target
+                                await self._ensure_lane_green(target)
+                            else:
+                                # Ensure it stays green (refresh if needed, though _ensure handles checks)
+                                await self._ensure_lane_green(target)
+                        
+                        # --- STATE 2: Multi-Emergency Conflict (Round-Robin) ---
+                        elif count > 1:
+                            sorted_lanes = sorted(self.active_emergency_lanes)
+                            
+                            # If we don't have a valid emergency target yet (or it disappeared)
+                            if self.emergency_lane_id not in sorted_lanes:
+                                # Pick the first available
+                                self.emergency_lane_id = sorted_lanes[0]
+                                print(f"🚨 Multi-Emergency: Starting Round Robin with Lane {self.emergency_lane_id}")
+                                await self._ensure_lane_green(self.emergency_lane_id)
+                                self.last_switch_time = time.time()
+                            
+                            # If we have a target, check if its time is up
+                            elif now - self.last_switch_time >= self.green_duration:
+                                # Switch to next
+                                current_idx = sorted_lanes.index(self.emergency_lane_id)
+                                next_idx = (current_idx + 1) % len(sorted_lanes)
+                                next_lane = sorted_lanes[next_idx]
+                                
+                                print(f"🚨 Multi-Emergency: Time up. Switching to Lane {next_lane}")
+                                self.emergency_lane_id = next_lane
+                                await self._ensure_lane_green(next_lane)
+                                self.last_switch_time = time.time()
+                            
+                            else:
+                                # Keep current green
+                                await self._ensure_lane_green(self.emergency_lane_id)
+
+            except Exception as e:
+                print(f"Error in traffic control loop: {e}")
+                
+            await asyncio.sleep(0.1)
+
+    async def _ensure_lane_green(self, target_lane_id: int):
+        """
+        Safely switches signals to make target_lane_id GREEN.
+        Includes Yellow clearance if switching from another Green lane.
+        """
+        target_lane = next((l for l in self.lanes if l.lane_id == target_lane_id), None)
+        if not target_lane: return
+
+        # If already Green, ensure others are Red (sanity check)
+        if target_lane.state == SignalState.GREEN:
+            for lane in self.lanes:
+                if lane.lane_id != target_lane_id and lane.state != SignalState.RED:
+                    lane.state = SignalState.RED
+                    self.hardware.send_update(lane.lane_id, lane.state)
+            return
+
+        # Perform Switch
+        print(f"🚦 Switching Signal Priority to Lane {target_lane_id}...")
+        
+        # 1. Turn active GREEN lane to YELLOW -> wait -> RED
+        for lane in self.lanes:
+            if lane.state == SignalState.GREEN:
                 lane.state = SignalState.YELLOW
                 self.hardware.send_update(lane.lane_id, lane.state)
-                
+                # We are holding the lock, so this pause is safe for state consistency
                 await asyncio.sleep(self.yellow_duration)
                 
                 lane.state = SignalState.RED
                 self.hardware.send_update(lane.lane_id, lane.state)
-                print(f"Switching Lane {lane.lane_id} to RED.")
-
-            # 3. Ensure all others are RED
-            for i, lane in enumerate(self.lanes):
-                if lane.lane_id != lane_id:
-                    if lane.state != SignalState.RED:
-                        lane.state = SignalState.RED
-                        self.hardware.send_update(lane.lane_id, lane.state)
-                else:
-                    # 4. Set Emergency Lane to GREEN and update index
-                    if lane.state != SignalState.GREEN:
-                        print(f"Switching Emergency Lane {lane_id} to GREEN.")
-                        lane.state = SignalState.GREEN
-                        self.hardware.send_update(lane.lane_id, lane.state)
-                    self.current_green_lane_index = i
-            
-            self.last_switch_time = time.time()
-
-    async def _control_loop(self):
-        while self.running:
-            if not self.emergency_mode:
-                now = time.time()
-                if now - self.last_switch_time >= self.green_duration:
-                    await self._cycle_next_lane()
-            await asyncio.sleep(0.1)
+        
+        # 2. Turn Target to GREEN
+        target_lane.state = SignalState.GREEN
+        self.hardware.send_update(target_lane.lane_id, target_lane.state)
+        
+        # Sync index for normal cycle restoration logic
+        self.current_green_lane_index = target_lane_id - 1
 
     async def _cycle_next_lane(self):
-        async with self._lock:
-            # Re-check emergency mode inside lock to prevent race conditions
-            if self.emergency_mode:
-                return
-
-            # Current Green -> Yellow -> Red
-            current_lane = self.lanes[self.current_green_lane_index]
-            if current_lane.state == SignalState.GREEN:
-                current_lane.state = SignalState.YELLOW
-                self.hardware.send_update(current_lane.lane_id, current_lane.state)
-                
-                await asyncio.sleep(self.yellow_duration)
-                
-                current_lane.state = SignalState.RED
-                self.hardware.send_update(current_lane.lane_id, current_lane.state)
+        # Current Green -> Yellow -> Red
+        current_lane = self.lanes[self.current_green_lane_index]
+        if current_lane.state == SignalState.GREEN:
+            current_lane.state = SignalState.YELLOW
+            self.hardware.send_update(current_lane.lane_id, current_lane.state)
             
-            # Next Lane
-            self.current_green_lane_index = (self.current_green_lane_index + 1) % len(self.lanes)
-            next_lane = self.lanes[self.current_green_lane_index]
-            next_lane.state = SignalState.GREEN
-            self.hardware.send_update(next_lane.lane_id, next_lane.state)
+            await asyncio.sleep(self.yellow_duration)
             
-            self.last_switch_time = time.time()
+            current_lane.state = SignalState.RED
+            self.hardware.send_update(current_lane.lane_id, current_lane.state)
+        
+        # Next Lane
+        self.current_green_lane_index = (self.current_green_lane_index + 1) % len(self.lanes)
+        next_lane = self.lanes[self.current_green_lane_index]
+        next_lane.state = SignalState.GREEN
+        self.hardware.send_update(next_lane.lane_id, next_lane.state)
+        
+        self.last_switch_time = time.time()
             
     def set_lane_green(self, lane_id: int):
-        # Synchronous override, usually called from start() or non-async context
+        # Synchronous override
         for i, lane in enumerate(self.lanes):
             if lane.lane_id == lane_id:
                 lane.state = SignalState.GREEN
                 self.current_green_lane_index = i
             else:
                 lane.state = SignalState.RED
-            # Initial hardware sync
             self.hardware.send_update(lane.lane_id, lane.state)
         self.last_switch_time = time.time()
 
     async def force_green(self, lane_id: int):
-        """Manually force a lane to green with yellow clearance for others."""
+        """Manually force a lane to green (User override)."""
         async with self._lock:
-            # Similar logic to emergency preemption but without setting emergency_mode permanent
-            active_lane_idx = -1
-            for i, lane in enumerate(self.lanes):
-                if lane.state == SignalState.GREEN and lane.lane_id != lane_id:
-                    active_lane_idx = i
-                    break
-            
-            if active_lane_idx != -1:
-                lane = self.lanes[active_lane_idx]
-                lane.state = SignalState.YELLOW
-                self.hardware.send_update(lane.lane_id, lane.state)
-                
-                await asyncio.sleep(self.yellow_duration)
-                
-                lane.state = SignalState.RED
-                self.hardware.send_update(lane.lane_id, lane.state)
-
-            self.set_lane_green(lane_id)
-
+            await self._ensure_lane_green(lane_id)
+            self.last_switch_time = time.time()

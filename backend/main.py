@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -19,32 +19,22 @@ from stream import VideoManager
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Load Sources from JSON
-try:
-    with open("sources.json", "r") as f:
-        config = json.load(f)
-        video_sources = {}
-        # Only add lanes that are explicitly configured
-        for lane_num in [1, 2, 3, 4]:
-            lane_key = f"lane{lane_num}"
-            if lane_key in config:
-                video_sources[lane_num] = config[lane_key]
-except Exception as e:
-    print(f"Error loading sources.json: {e}. Starting with no videos.")
-    video_sources = {}
+# === STAGING SYSTEM ===
+# Videos are staged here before system start
+video_staging = {1: None, 2: None, 3: None, 4: None}
 
-video_manager = VideoManager(video_sources)
-traffic_controller = TrafficController()
-detector = EmergencyDetector() # Loads best.pt
+# Global instances (initialized as None, created on /simulation/start)
+video_manager = None
+traffic_controller = None
+detector = EmergencyDetector()  # Loads best.pt
 
 latest_processed_frames = {}
 latest_detections = {}  # Store detection info per lane
 
-# Video initialization tracking
+# System state tracking
 processing_started = False
-system_started = False  # Track if entire system (video_manager + traffic_controller + processing) has started
-lanes_with_videos = set()  # Track which lanes have videos loaded
-processing_task = None  # Store the processing task reference
+system_started = False
+processing_task = None
 
 async def start_processing():
     """Start the processing loop if not already started"""
@@ -77,22 +67,14 @@ async def start_system():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    # Check if all lanes already have videos from sources.json
-    for lane_id in [1, 2, 3, 4]:
-        if lane_id in video_sources:
-            lanes_with_videos.add(lane_id)
-    
-    # If all 4 lanes have videos, start the entire system
-    if len(lanes_with_videos) == 4:
-        await start_system()
-    else:
-        print(f"⏳ Waiting for all videos to be uploaded. Currently have {len(lanes_with_videos)}/4 lanes ready.")
+    # Startup - No auto-start, wait for user to upload and start
+    print("🚦 Backend ready. Upload videos to all 4 lanes, then hit /simulation/start")
     
     yield
     
-    # Shutdown - only stop if system was started
-    if system_started:
+    # Shutdown - stop if system was started
+    global video_manager, traffic_controller
+    if system_started and video_manager and traffic_controller:
         video_manager.stop_all()
         await traffic_controller.stop()
 
@@ -109,10 +91,16 @@ app.add_middleware(
 async def processing_loop():
     frame_count = 0
     while True:
+        # Check if system is ready
+        if not video_manager or not traffic_controller:
+            await asyncio.sleep(0.1)
+            continue
+            
         start_time = time.time()
         
         # Run detection every 3 frames to save CPU
         run_inference = (frame_count % 3 == 0)
+        current_emergency_lanes = []
         
         for lane_id in [1, 2, 3, 4]:
             frame = video_manager.get_frame(lane_id)
@@ -121,19 +109,20 @@ async def processing_loop():
             
             # 1. Run inference if it's an inference frame
             if run_inference:
+                # Emergency Detection
                 has_emergency, annotated, detections = detector.detect(frame)
                 
-                # Store detections for WebSocket
+                # Determine display frame
+                if has_emergency:
+                    display_frame = annotated
+                    current_emergency_lanes.append(lane_id)
+                else:
+                    display_frame = frame
+
+                # Store detections
                 latest_detections[lane_id] = detections
                 
-                # Update controller
-                traffic_controller.set_emergency(lane_id, has_emergency)
-                
-                # Use annotated frame for the stream
-                display_frame = annotated
             else:
-                # Use raw frame or previous annotated frame? 
-                # To keep it simple and responsive, use raw frame for non-inference loops
                 display_frame = frame
 
             # 2. ALWAYS update the latest frame for streaming
@@ -141,7 +130,11 @@ async def processing_loop():
                 _, buffer = cv2.imencode('.jpg', display_frame)
                 latest_processed_frames[lane_id] = buffer.tobytes()
             except Exception as e:
-                print(f"Error encoding frame for Lane {lane_id}: {e}")
+                pass
+
+        # Batch Update the Controller after checking all lanes
+        if run_inference:
+            traffic_controller.update_emergency_state(current_emergency_lanes)
 
         frame_count += 1
         # Sleep slightly to maintain ~30FPS and yield control
@@ -221,69 +214,112 @@ async def force_signal(lane_id: int):
 
 @app.post("/signal/{lane_id}/simulate_emergency")
 async def simulate_emergency(lane_id: int, active: bool):
-    traffic_controller.set_emergency(lane_id, active)
-    return {"status": "success", "emergency": active}
+    # traffic_controller.set_emergency(lane_id, active)
+    # NOTE: Simulation disabled as it conflicts with the continuous detection loop in this version.
+    return {"status": "ignored", "message": "Simulation disabled in active loop mode"}
 
 @app.post("/upload/{lane_id}")
 async def upload_video(lane_id: int, file: UploadFile = File(...)):
-    global lanes_with_videos
+    """Stage a video for a lane without starting system"""
+    if lane_id not in [1, 2, 3, 4]:
+        return {"status": "error", "message": "Lane ID must be 1-4"}
     
     file_path = os.path.join(UPLOAD_DIR, f"lane{lane_id}_{file.filename}")
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    # Update video manager with new file source
-    video_manager.update_source(lane_id, file_path)
+    # Stage the video
+    video_staging[lane_id] = file_path
     
-    # Track this lane as having a video
-    lanes_with_videos.add(lane_id)
-    print(f"✅ Video uploaded for Lane {lane_id}. Total lanes ready: {len(lanes_with_videos)}/4")
+    # Count how many lanes are ready
+    staged_count = sum(1 for v in video_staging.values() if v is not None)
     
-    # Update sources.json so it persists (optional but good)
-    try:
-        with open("sources.json", "r") as f:
-            config = json.load(f)
-        config[f"lane{lane_id}"] = file_path
-        with open("sources.json", "w") as f:
-            json.dump(config, f)
-    except:
-        pass
+    print(f"✅ Video staged for Lane {lane_id}. Total staged: {staged_count}/4")
     
-    # Auto-start entire system when all 4 lanes have videos
-    if len(lanes_with_videos) == 4 and not system_started:
-        await start_system()
-
     return {
-        "status": "success", 
+        "status": "staged",
+        "lane_id": lane_id,
         "file_path": file_path,
-        "lanes_ready": len(lanes_with_videos),
-        "processing_started": processing_started,
-        "system_started": system_started
+        "staged_count": staged_count,
+        "all_ready": staged_count == 4
     }
 
-@app.post("/start_processing")
-async def manual_start_processing():
-    """Manually start the entire system (useful for testing or if auto-start fails)"""
+@app.post("/simulation/start")
+async def start_simulation(background_tasks: BackgroundTasks):
+    """Start the simulation with all staged videos"""
+    global video_manager, traffic_controller, system_started, processing_started
+    
+    # Validate all 4 lanes have videos
+    if any(v is None for v in video_staging.values()):
+        missing = [k for k, v in video_staging.items() if v is None]
+        return {
+            "status": "error",
+            "message": f"Missing videos for lanes: {missing}. Please upload all 4 videos first."
+        }, 400
+    
     if system_started:
         return {"status": "already_running", "message": "System is already running"}
     
-    if len(lanes_with_videos) < 4:
-        return {
-            "status": "error", 
-            "message": f"Cannot start system. Need all 4 videos. Currently have {len(lanes_with_videos)}/4 lanes ready."
-        }
+    # Initialize video manager with staged videos
+    video_manager = VideoManager(video_staging)
+    traffic_controller = TrafficController()
     
-    await start_system()
-    return {"status": "success", "message": "System started successfully"}
+    # Start system in background
+    background_tasks.add_task(start_system)
+    
+    print("🚀 Simulation starting with all 4 videos synchronized...")
+    
+    return {
+        "status": "started",
+        "message": "Simulation started successfully",
+        "lanes": list(video_staging.keys())
+    }
+
+@app.post("/simulation/reset")
+async def reset_simulation():
+    """Reset the simulation and clear all staged videos"""
+    global video_manager, traffic_controller, system_started, processing_started, processing_task, video_staging
+    
+    # Stop system if running
+    if system_started:
+        if video_manager:
+            video_manager.stop_all()
+        if traffic_controller:
+            await traffic_controller.stop()
+        if processing_task:
+            processing_task.cancel()
+            try:
+                await processing_task
+            except asyncio.CancelledError:
+                pass
+    
+    # Reset state
+    system_started = False
+    processing_started = False
+    processing_task = None
+    video_manager = None
+    traffic_controller = None
+    video_staging = {1: None, 2: None, 3: None, 4: None}
+    latest_processed_frames.clear()
+    latest_detections.clear()
+    
+    print("♻️ Simulation reset complete")
+    
+    return {
+        "status": "reset",
+        "message": "Simulation reset successfully. Upload new videos to start again."
+    }
 
 @app.get("/status")
 async def get_status():
     """Get current backend status"""
+    staged_count = sum(1 for v in video_staging.values() if v is not None)
     return {
         "system_started": system_started,
         "processing_started": processing_started,
-        "lanes_ready": len(lanes_with_videos),
-        "lanes_with_videos": list(lanes_with_videos)
+        "staged_count": staged_count,
+        "all_ready": staged_count == 4,
+        "video_staging": {k: (v is not None) for k, v in video_staging.items()}
     }
 
 @app.delete("/videos")
